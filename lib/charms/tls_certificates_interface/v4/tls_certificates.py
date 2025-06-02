@@ -9,7 +9,7 @@ interface.
 Pre-requisites:
   - Juju >= 3.0
   - cryptography >= 43.0.0
-  - pydantic >= 1.0
+  - pydantic
 
 Learn more on how-to use the TLS Certificates interface library by reading the documentation:
 - https://charmhub.io/tls-certificates-interface/
@@ -27,13 +27,12 @@ from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import FrozenSet, List, MutableMapping, Optional, Tuple, Union
 
-import pydantic
 from cryptography import x509
-from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat._oid import ExtensionOID
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
-from cryptography.x509.oid import ExtensionOID, NameOID
-from ops import BoundEvent, CharmBase, CharmEvents, Secret, SecretExpiredEvent, SecretRemoveEvent
+from cryptography.x509.oid import NameOID
+from ops import BoundEvent, CharmBase, CharmEvents, SecretExpiredEvent
 from ops.framework import EventBase, EventSource, Handle, Object
 from ops.jujuversion import JujuVersion
 from ops.model import (
@@ -43,6 +42,7 @@ from ops.model import (
     SecretNotFoundError,
     Unit,
 )
+from pydantic import BaseModel, ConfigDict, ValidationError
 
 # The unique Charmhub library identifier, never change it
 LIBID = "afd8c2bccf834997afce12c2706d2ede"
@@ -52,12 +52,9 @@ LIBAPI = 4
 
 # Increment this PATCH version before using `charmcraft publish-lib` or reset
 # to 0 if you are raising the major API version
-LIBPATCH = 17
+LIBPATCH = 1
 
-PYDEPS = [
-    "cryptography>=43.0.0",
-    "pydantic",
-]
+PYDEPS = ["cryptography", "pydantic"]
 
 logger = logging.getLogger(__name__)
 
@@ -70,142 +67,76 @@ class DataValidationError(TLSCertificatesError):
     """Raised when data validation fails."""
 
 
-if int(pydantic.version.VERSION.split(".")[0]) < 2:
+class _DatabagModel(BaseModel):
+    """Base databag model."""
 
-    class _DatabagModel(pydantic.BaseModel):  # type: ignore
-        """Base databag model."""
+    model_config = ConfigDict(
+        # tolerate additional keys in databag
+        extra="ignore",
+        # Allow instantiating this class by field name (instead of forcing alias).
+        populate_by_name=True,
+        # Custom config key: whether to nest the whole datastructure (as json)
+        # under a field or spread it out at the toplevel.
+        _NEST_UNDER=None,
+    )  # type: ignore
+    """Pydantic config."""
 
-        class Config:
-            """Pydantic config."""
+    @classmethod
+    def load(cls, databag: MutableMapping):
+        """Load this model from a Juju databag."""
+        nest_under = cls.model_config.get("_NEST_UNDER")
+        if nest_under:
+            return cls.model_validate(json.loads(databag[nest_under]))
 
-            # ignore any extra fields in the databag
-            extra = "ignore"
-            """Ignore any extra fields in the databag."""
-            allow_population_by_field_name = True
-            """Allow instantiating this class by field name (instead of forcing alias)."""
+        try:
+            data = {
+                k: json.loads(v)
+                for k, v in databag.items()
+                # Don't attempt to parse model-external values
+                if k in {(f.alias or n) for n, f in cls.model_fields.items()}
+            }
+        except json.JSONDecodeError as e:
+            msg = f"invalid databag contents: expecting json. {databag}"
+            logger.error(msg)
+            raise DataValidationError(msg) from e
 
-        _NEST_UNDER = None
+        try:
+            return cls.model_validate_json(json.dumps(data))
+        except ValidationError as e:
+            msg = f"failed to validate databag: {databag}"
+            logger.debug(msg, exc_info=True)
+            raise DataValidationError(msg) from e
 
-        @classmethod
-        def load(cls, databag: MutableMapping):
-            """Load this model from a Juju databag."""
-            if cls._NEST_UNDER:
-                return cls.parse_obj(json.loads(databag[cls._NEST_UNDER]))
+    def dump(self, databag: Optional[MutableMapping] = None, clear: bool = True):
+        """Write the contents of this model to Juju databag.
 
-            try:
-                data = {
-                    k: json.loads(v)
-                    for k, v in databag.items()
-                    # Don't attempt to parse model-external values
-                    if k in {f.alias for f in cls.__fields__.values()}
-                }
-            except json.JSONDecodeError as e:
-                msg = f"invalid databag contents: expecting json. {databag}"
-                logger.error(msg)
-                raise DataValidationError(msg) from e
+        Args:
+            databag: The databag to write to.
+            clear: Whether to clear the databag before writing.
 
-            try:
-                return cls.parse_raw(json.dumps(data))  # type: ignore
-            except pydantic.ValidationError as e:
-                msg = f"failed to validate databag: {databag}"
-                logger.debug(msg, exc_info=True)
-                raise DataValidationError(msg) from e
+        Returns:
+            MutableMapping: The databag.
+        """
+        if clear and databag:
+            databag.clear()
 
-        def dump(self, databag: Optional[MutableMapping] = None, clear: bool = True):
-            """Write the contents of this model to Juju databag.
-
-            :param databag: the databag to write the data to.
-            :param clear: ensure the databag is cleared before writing it.
-            """
-            if clear and databag:
-                databag.clear()
-
-            if databag is None:
-                databag = {}
-
-            if self._NEST_UNDER:
-                databag[self._NEST_UNDER] = self.json(by_alias=True, exclude_defaults=True)
-                return databag
-
-            dct = self.dict(by_alias=True, exclude_defaults=True)
-            databag.update({k: json.dumps(v) for k, v in dct.items()})
-
+        if databag is None:
+            databag = {}
+        nest_under = self.model_config.get("_NEST_UNDER")
+        if nest_under:
+            databag[nest_under] = self.model_dump_json(
+                by_alias=True,
+                # skip keys whose values are default
+                exclude_defaults=True,
+            )
             return databag
 
-else:
-    from pydantic import ConfigDict
-
-    class _DatabagModel(pydantic.BaseModel):
-        """Base databag model."""
-
-        model_config = ConfigDict(
-            # tolerate additional keys in databag
-            extra="ignore",
-            # Allow instantiating this class by field name (instead of forcing alias).
-            populate_by_name=True,
-            # Custom config key: whether to nest the whole datastructure (as json)
-            # under a field or spread it out at the toplevel.
-            _NEST_UNDER=None,  # type: ignore
-        )
-        """Pydantic config."""
-
-        @classmethod
-        def load(cls, databag: MutableMapping):
-            """Load this model from a Juju databag."""
-            nest_under = cls.model_config.get("_NEST_UNDER")
-            if nest_under:
-                return cls.model_validate(json.loads(databag[nest_under]))
-
-            try:
-                data = {
-                    k: json.loads(v)
-                    for k, v in databag.items()
-                    # Don't attempt to parse model-external values
-                    if k in {(f.alias or n) for n, f in cls.model_fields.items()}
-                }
-            except json.JSONDecodeError as e:
-                msg = f"invalid databag contents: expecting json. {databag}"
-                logger.error(msg)
-                raise DataValidationError(msg) from e
-
-            try:
-                return cls.model_validate_json(json.dumps(data))
-            except pydantic.ValidationError as e:
-                msg = f"failed to validate databag: {databag}"
-                logger.debug(msg, exc_info=True)
-                raise DataValidationError(msg) from e
-
-        def dump(self, databag: Optional[MutableMapping] = None, clear: bool = True):
-            """Write the contents of this model to Juju databag.
-
-            Args:
-                databag: The databag to write to.
-                clear: Whether to clear the databag before writing.
-
-            Returns:
-                MutableMapping: The databag.
-            """
-            if clear and databag:
-                databag.clear()
-
-            if databag is None:
-                databag = {}
-            nest_under = self.model_config.get("_NEST_UNDER")
-            if nest_under:
-                databag[nest_under] = self.model_dump_json(
-                    by_alias=True,
-                    # skip keys whose values are default
-                    exclude_defaults=True,
-                )
-                return databag
-
-            dct = self.model_dump(mode="json", by_alias=True, exclude_defaults=True)
-            databag.update({k: json.dumps(v) for k, v in dct.items()})
-
-            return databag
+        dct = self.model_dump(mode="json", by_alias=True, exclude_defaults=True)
+        databag.update({k: json.dumps(v) for k, v in dct.items()})
+        return databag
 
 
-class _Certificate(pydantic.BaseModel):
+class _Certificate(BaseModel):
     """Certificate model."""
 
     ca: str
@@ -230,7 +161,7 @@ class _Certificate(pydantic.BaseModel):
         )
 
 
-class _CertificateSigningRequest(pydantic.BaseModel):
+class _CertificateSigningRequest(BaseModel):
     """Certificate signing request model."""
 
     certificate_signing_request: str
@@ -240,7 +171,7 @@ class _CertificateSigningRequest(pydantic.BaseModel):
 class _ProviderApplicationData(_DatabagModel):
     """Provider application data model."""
 
-    certificates: List[_Certificate] = []
+    certificates: List[_Certificate]
 
 
 class _RequirerData(_DatabagModel):
@@ -249,18 +180,16 @@ class _RequirerData(_DatabagModel):
     The same model is used for the unit and application data.
     """
 
-    certificate_signing_requests: List[_CertificateSigningRequest] = []
+    certificate_signing_requests: List[_CertificateSigningRequest]
 
 
 class Mode(Enum):
     """Enum representing the mode of the certificate request.
 
     UNIT (default): Request a certificate for the unit.
-        Each unit will manage its private key,
-        certificate signing request and certificate.
+        Each unit will have its own private key and certificate.
     APP: Request a certificate for the application.
-        Only the leader unit will manage the private key, certificate signing request
-        and certificate.
+        The private key and certificate will be shared by all units.
     """
 
     UNIT = 1
@@ -281,27 +210,6 @@ class PrivateKey:
     def from_string(cls, private_key: str) -> "PrivateKey":
         """Create a PrivateKey object from a private key."""
         return cls(raw=private_key.strip())
-
-    def is_valid(self) -> bool:
-        """Validate that the private key is PEM-formatted, RSA, and at least 2048 bits."""
-        try:
-            key = serialization.load_pem_private_key(
-                self.raw.encode(),
-                password=None,
-            )
-
-            if not isinstance(key, rsa.RSAPrivateKey):
-                logger.warning("Private key is not an RSA key")
-                return False
-
-            if key.key_size < 2048:
-                logger.warning("RSA key size is less than 2048 bits")
-                return False
-
-            return True
-        except ValueError:
-            logger.warning("Invalid private key format")
-            return False
 
 
 @dataclass(frozen=True)
@@ -397,37 +305,6 @@ class Certificate:
             validity_start_time=validity_start_time,
         )
 
-    def matches_private_key(self, private_key: PrivateKey) -> bool:
-        """Check if this certificate matches a given private key.
-
-        Args:
-            private_key (PrivateKey): The private key to validate against.
-
-        Returns:
-            bool: True if the certificate matches the private key, False otherwise.
-        """
-        try:
-            cert_object = x509.load_pem_x509_certificate(self.raw.encode())
-            key_object = serialization.load_pem_private_key(
-                private_key.raw.encode(), password=None
-            )
-
-            cert_public_key = cert_object.public_key()
-            key_public_key = key_object.public_key()
-
-            if not isinstance(cert_public_key, rsa.RSAPublicKey):
-                logger.warning("Certificate does not use RSA public key")
-                return False
-
-            if not isinstance(key_public_key, rsa.RSAPublicKey):
-                logger.warning("Private key is not an RSA key")
-                return False
-
-            return cert_public_key.public_numbers() == key_public_key.public_numbers()
-        except Exception as e:
-            logger.warning("Failed to validate certificate and private key match: %s", e)
-            return False
-
 
 @dataclass(frozen=True)
 class CertificateSigningRequest:
@@ -444,7 +321,6 @@ class CertificateSigningRequest:
     country_name: Optional[str] = None
     state_or_province_name: Optional[str] = None
     locality_name: Optional[str] = None
-    has_unique_identifier: bool = False
 
     def __eq__(self, other: object) -> bool:
         """Check if two CertificateSigningRequest objects are equal."""
@@ -471,20 +347,12 @@ class CertificateSigningRequest:
         )
         locality_name = csr_object.subject.get_attributes_for_oid(NameOID.LOCALITY_NAME)
         organization_name = csr_object.subject.get_attributes_for_oid(NameOID.ORGANIZATION_NAME)
-        organizational_unit = csr_object.subject.get_attributes_for_oid(
-            NameOID.ORGANIZATIONAL_UNIT_NAME
-        )
         email_address = csr_object.subject.get_attributes_for_oid(NameOID.EMAIL_ADDRESS)
-        unique_identifier = csr_object.subject.get_attributes_for_oid(
-            NameOID.X500_UNIQUE_IDENTIFIER
-        )
         try:
             sans = csr_object.extensions.get_extension_for_class(x509.SubjectAlternativeName).value
             sans_dns = frozenset(sans.get_values_for_type(x509.DNSName))
             sans_ip = frozenset([str(san) for san in sans.get_values_for_type(x509.IPAddress)])
-            sans_oid = frozenset(
-                [san.dotted_string for san in sans.get_values_for_type(x509.RegisteredID)]
-            )
+            sans_oid = frozenset([str(san) for san in sans.get_values_for_type(x509.RegisteredID)])
         except x509.ExtensionNotFound:
             sans = frozenset()
             sans_dns = frozenset()
@@ -499,12 +367,10 @@ class CertificateSigningRequest:
             else None,
             locality_name=str(locality_name[0].value) if locality_name else None,
             organization=str(organization_name[0].value) if organization_name else None,
-            organizational_unit=str(organizational_unit[0].value) if organizational_unit else None,
             email_address=str(email_address[0].value) if email_address else None,
             sans_dns=sans_dns,
             sans_ip=sans_ip,
             sans_oid=sans_oid,
-            has_unique_identifier=bool(unique_identifier),
         )
 
     def matches_private_key(self, key: PrivateKey) -> bool:
@@ -579,7 +445,6 @@ class CertificateRequestAttributes:
     state_or_province_name: Optional[str] = None
     locality_name: Optional[str] = None
     is_ca: bool = False
-    add_unique_id_to_subject_name: bool = True
 
     def is_valid(self) -> bool:
         """Check whether the certificate request is valid."""
@@ -611,7 +476,6 @@ class CertificateRequestAttributes:
             country_name=self.country_name,
             state_or_province_name=self.state_or_province_name,
             locality_name=self.locality_name,
-            add_unique_id_to_subject_name=self.add_unique_id_to_subject_name,
         )
 
     @classmethod
@@ -629,7 +493,6 @@ class CertificateRequestAttributes:
             state_or_province_name=csr.state_or_province_name,
             locality_name=csr.locality_name,
             is_ca=is_ca,
-            add_unique_id_to_subject_name=csr.has_unique_identifier,
         )
 
 
@@ -718,14 +581,12 @@ def generate_private_key(
     """Generate a private key with the RSA algorithm.
 
     Args:
-        key_size (int): Key size in bits, must be at least 2048 bits
+        key_size (int): Key size in bytes
         public_exponent: Public exponent.
 
     Returns:
         PrivateKey: Private Key
     """
-    if key_size < 2048:
-        raise ValueError("Key size must be at least 2048 bits for RSA security")
     private_key = rsa.generate_private_key(
         public_exponent=public_exponent,
         key_size=key_size,
@@ -736,32 +597,6 @@ def generate_private_key(
         encryption_algorithm=serialization.NoEncryption(),
     )
     return PrivateKey.from_string(key_bytes.decode())
-
-
-def chain_has_valid_order(chain: List[str]) -> bool:
-    """Check if the chain has a valid order.
-
-    Validates that each certificate in the chain is properly signed by the next certificate.
-    The chain should be ordered from leaf to root, where each certificate is signed by
-    the next one in the chain.
-
-    Args:
-        chain (List[str]): List of certificates in PEM format, ordered from leaf to root
-
-    Returns:
-        bool: True if the chain has a valid order, False otherwise.
-    """
-    if len(chain) < 2:
-        return True
-
-    try:
-        for i in range(len(chain) - 1):
-            cert = x509.load_pem_x509_certificate(chain[i].encode())
-            issuer = x509.load_pem_x509_certificate(chain[i + 1].encode())
-            cert.verify_directly_issued_by(issuer)
-        return True
-    except (ValueError, TypeError, InvalidSignature):
-        return False
 
 
 def generate_csr(  # noqa: C901
@@ -893,6 +728,14 @@ def generate_ca(
     if locality_name:
         subject_name.append(x509.NameAttribute(x509.NameOID.LOCALITY_NAME, locality_name))
 
+    _sans: List[x509.GeneralName] = []
+    if sans_oid:
+        _sans.extend([x509.RegisteredID(x509.ObjectIdentifier(san)) for san in sans_oid])
+    if sans_ip:
+        _sans.extend([x509.IPAddress(ipaddress.ip_address(san)) for san in sans_ip])
+    if sans_dns:
+        _sans.extend([x509.DNSName(san) for san in sans_dns])
+
     subject_identifier_object = x509.SubjectKeyIdentifier.from_public_key(
         private_key_object.public_key()
     )
@@ -908,15 +751,15 @@ def generate_ca(
         encipher_only=False,
         decipher_only=False,
     )
-
-    builder = (
+    cert = (
         x509.CertificateBuilder()
         .subject_name(x509.Name(subject_name))
-        .issuer_name(x509.Name(subject_name))
+        .issuer_name(x509.Name([x509.NameAttribute(x509.NameOID.COMMON_NAME, common_name)]))
         .public_key(private_key_object.public_key())
         .serial_number(x509.random_serial_number())
         .not_valid_before(datetime.now(timezone.utc))
         .not_valid_after(datetime.now(timezone.utc) + validity)
+        .add_extension(x509.SubjectAlternativeName(set(_sans)), critical=False)
         .add_extension(x509.SubjectKeyIdentifier(digest=subject_identifier), critical=False)
         .add_extension(
             x509.AuthorityKeyIdentifier(
@@ -931,39 +774,10 @@ def generate_ca(
             x509.BasicConstraints(ca=True, path_length=None),
             critical=True,
         )
+        .sign(private_key_object, hashes.SHA256())  # type: ignore[arg-type]
     )
-    san_extension = _san_extension(
-        email_address=email_address,
-        sans_dns=sans_dns,
-        sans_ip=sans_ip,
-        sans_oid=sans_oid,
-    )
-    if san_extension:
-        builder = builder.add_extension(san_extension, critical=False)
-    cert = builder.sign(private_key_object, hashes.SHA256())  # type: ignore[arg-type]
     ca_cert_str = cert.public_bytes(serialization.Encoding.PEM).decode().strip()
     return Certificate.from_string(ca_cert_str)
-
-
-def _san_extension(
-    email_address: Optional[str] = None,
-    sans_dns: Optional[FrozenSet[str]] = frozenset(),
-    sans_ip: Optional[FrozenSet[str]] = frozenset(),
-    sans_oid: Optional[FrozenSet[str]] = frozenset(),
-) -> Optional[x509.SubjectAlternativeName]:
-    sans: List[x509.GeneralName] = []
-    if email_address:
-        # If an e-mail address was provided, it should always be in the SAN
-        sans.append(x509.RFC822Name(email_address))
-    if sans_dns:
-        sans.extend([x509.DNSName(san) for san in sans_dns])
-    if sans_ip:
-        sans.extend([x509.IPAddress(ipaddress.ip_address(san)) for san in sans_ip])
-    if sans_oid:
-        sans.extend([x509.RegisteredID(x509.ObjectIdentifier(san)) for san in sans_oid])
-    if not sans:
-        return None
-    return x509.SubjectAlternativeName(sans)
 
 
 def generate_certificate(
@@ -1000,7 +814,7 @@ def generate_certificate(
         .not_valid_before(datetime.now(timezone.utc))
         .not_valid_after(datetime.now(timezone.utc) + validity)
     )
-    extensions = _generate_certificate_request_extensions(
+    extensions = _get_certificate_request_extensions(
         authority_key_identifier=ca_pem.extensions.get_extension_for_class(
             x509.SubjectKeyIdentifier
         ).value.key_identifier,
@@ -1021,7 +835,7 @@ def generate_certificate(
     return Certificate.from_string(cert_bytes.decode().strip())
 
 
-def _generate_certificate_request_extensions(
+def _get_certificate_request_extensions(
     authority_key_identifier: bytes,
     csr: x509.CertificateSigningRequest,
     is_ca: bool,
@@ -1057,8 +871,32 @@ def _generate_certificate_request_extensions(
             value=x509.BasicConstraints(ca=is_ca, path_length=None),
         ),
     ]
-    if sans := _generate_subject_alternative_name_extension(csr):
-        cert_extensions_list.append(sans)
+    sans: List[x509.GeneralName] = []
+    try:
+        loaded_san_ext = csr.extensions.get_extension_for_class(x509.SubjectAlternativeName)
+        sans.extend(
+            [x509.DNSName(name) for name in loaded_san_ext.value.get_values_for_type(x509.DNSName)]
+        )
+        sans.extend(
+            [x509.IPAddress(ip) for ip in loaded_san_ext.value.get_values_for_type(x509.IPAddress)]
+        )
+        sans.extend(
+            [
+                x509.RegisteredID(oid)
+                for oid in loaded_san_ext.value.get_values_for_type(x509.RegisteredID)
+            ]
+        )
+    except x509.ExtensionNotFound:
+        pass
+
+    if sans:
+        cert_extensions_list.append(
+            x509.Extension(
+                oid=ExtensionOID.SUBJECT_ALTERNATIVE_NAME,
+                critical=False,
+                value=x509.SubjectAlternativeName(sans),
+            )
+        )
 
     if is_ca:
         cert_extensions_list.append(
@@ -1091,51 +929,6 @@ def _generate_certificate_request_extensions(
     return cert_extensions_list
 
 
-def _generate_subject_alternative_name_extension(
-    csr: x509.CertificateSigningRequest,
-) -> Optional[x509.Extension]:
-    sans: List[x509.GeneralName] = []
-    try:
-        loaded_san_ext = csr.extensions.get_extension_for_class(x509.SubjectAlternativeName)
-        sans.extend(
-            [x509.DNSName(name) for name in loaded_san_ext.value.get_values_for_type(x509.DNSName)]
-        )
-        sans.extend(
-            [x509.IPAddress(ip) for ip in loaded_san_ext.value.get_values_for_type(x509.IPAddress)]
-        )
-        sans.extend(
-            [
-                x509.RegisteredID(oid)
-                for oid in loaded_san_ext.value.get_values_for_type(x509.RegisteredID)
-            ]
-        )
-        sans.extend(
-            [
-                x509.RFC822Name(name)
-                for name in loaded_san_ext.value.get_values_for_type(x509.RFC822Name)
-            ]
-        )
-    except x509.ExtensionNotFound:
-        pass
-    # If email is present in the CSR Subject, make sure it is also in the SANS
-    # to conform to RFC 5280.
-    email = csr.subject.get_attributes_for_oid(NameOID.EMAIL_ADDRESS)
-    if email:
-        email_rfc822 = x509.RFC822Name(str(email[0].value))
-        if email_rfc822 not in sans:
-            sans.append(email_rfc822)
-
-    return (
-        x509.Extension(
-            oid=ExtensionOID.SUBJECT_ALTERNATIVE_NAME,
-            critical=False,
-            value=x509.SubjectAlternativeName(sans),
-        )
-        if sans
-        else None
-    )
-
-
 class CertificatesRequirerCharmEvents(CharmEvents):
     """List of events that the TLS Certificates requirer charm can leverage."""
 
@@ -1154,7 +947,6 @@ class TLSCertificatesRequiresV4(Object):
         certificate_requests: List[CertificateRequestAttributes],
         mode: Mode = Mode.UNIT,
         refresh_events: List[BoundEvent] = [],
-        private_key: Optional[PrivateKey] = None,
     ):
         """Create a new instance of the TLSCertificatesRequiresV4 class.
 
@@ -1164,23 +956,8 @@ class TLSCertificatesRequiresV4(Object):
             certificate_requests (List[CertificateRequestAttributes]):
                 A list with the attributes of the certificate requests.
             mode (Mode): Whether to use unit or app certificates mode. Default is Mode.UNIT.
-                In UNIT mode the requirer will place the csr in the unit relation data.
-                Each unit will manage its private key,
-                certificate signing request and certificate.
-                UNIT mode is for use cases where each unit has its own identity.
-                If you don't know which mode to use, you likely need UNIT.
-                In APP mode the leader unit will place the csr in the app relation databag.
-                APP mode is for use cases where the underlying application needs the certificate
-                for example using it as an intermediate CA to sign other certificates.
-                The certificate can only be accessed by the leader unit.
             refresh_events (List[BoundEvent]): A list of events to trigger a refresh of
               the certificates.
-            private_key (Optional[PrivateKey]): The private key to use for the certificates.
-                If provided, it will be used instead of generating a new one.
-                If the key is not valid an exception will be raised.
-                Using this parameter is discouraged,
-                having to pass around private keys manually can be a security concern.
-                Allowing the library to generate and manage the key is the more secure approach.
         """
         super().__init__(charm, relationship_name)
         if not JujuVersion.from_environ().has_secrets:
@@ -1194,13 +971,9 @@ class TLSCertificatesRequiresV4(Object):
         self.relationship_name = relationship_name
         self.certificate_requests = certificate_requests
         self.mode = mode
-        if private_key and not private_key.is_valid():
-            raise TLSCertificatesError("Invalid private key")
-        self._private_key = private_key
         self.framework.observe(charm.on[relationship_name].relation_created, self._configure)
         self.framework.observe(charm.on[relationship_name].relation_changed, self._configure)
         self.framework.observe(charm.on.secret_expired, self._on_secret_expired)
-        self.framework.observe(charm.on.secret_remove, self._on_secret_remove)
         for event in refresh_events:
             self.framework.observe(event, self._configure)
 
@@ -1215,32 +988,13 @@ class TLSCertificatesRequiresV4(Object):
         if not self._tls_relation_created():
             logger.debug("TLS relation not created yet.")
             return
-        self._ensure_private_key()
-        self._cleanup_certificate_requests()
+        self._generate_private_key()
         self._send_certificate_requests()
         self._find_available_certificates()
+        self._cleanup_certificate_requests()
 
-    def _mode_is_valid(self, mode: Mode) -> bool:
+    def _mode_is_valid(self, mode) -> bool:
         return mode in [Mode.UNIT, Mode.APP]
-
-    def _validate_secret_exists(self, secret: Secret) -> None:
-        secret.get_info()  # Will raise `SecretNotFoundError` if the secret does not exist
-
-    def _on_secret_remove(self, event: SecretRemoveEvent) -> None:
-        """Handle Secret Removed Event."""
-        try:
-            # Ensure the secret exists before trying to remove it, otherwise
-            # the unit could be stuck in an error state. See the docstring of
-            # `remove_revision` and the below issue for more information.
-            # https://github.com/juju/juju/issues/19036
-            self._validate_secret_exists(event.secret)
-            event.secret.remove_revision(event.revision)
-        except SecretNotFoundError:
-            logger.warning(
-                "No such secret %s, nothing to remove",
-                event.secret.label or event.secret.id,
-            )
-            return
 
     def _on_secret_expired(self, event: SecretExpiredEvent) -> None:
         """Handle Secret Expired Event.
@@ -1315,93 +1069,46 @@ class TLSCertificatesRequiresV4(Object):
         raise TLSCertificatesError("Invalid mode")
 
     @property
-    def private_key(self) -> Optional[PrivateKey]:
+    def private_key(self) -> PrivateKey | None:
         """Return the private key."""
-        if self._private_key:
-            return self._private_key
         if not self._private_key_generated():
             return None
         secret = self.charm.model.get_secret(label=self._get_private_key_secret_label())
         private_key = secret.get_content(refresh=True)["private-key"]
         return PrivateKey.from_string(private_key)
 
-    def _ensure_private_key(self) -> None:
-        """Make sure there is a private key to be used.
-
-        It will make sure there is a private key passed by the charm using the private_key
-        parameter or generate a new one otherwise.
-        """
-        # Remove the generated private key
-        # if one has been passed by the charm using the private_key parameter
-        if self._private_key:
-            self._remove_private_key_secret()
-            return
+    def _generate_private_key(self) -> None:
         if self._private_key_generated():
-            logger.debug("Private key already generated")
             return
-        self._generate_private_key()
+        private_key = generate_private_key()
+        self.charm.unit.add_secret(
+            content={"private-key": str(private_key)},
+            label=self._get_private_key_secret_label(),
+        )
+        logger.info("Private key generated")
 
     def regenerate_private_key(self) -> None:
         """Regenerate the private key.
 
         Generate a new private key, remove old certificate requests and send new ones.
-
-        Raises:
-            TLSCertificatesError: If the private key is passed by the charm using the
-                private_key parameter.
         """
-        if self._private_key:
-            raise TLSCertificatesError(
-                "Private key is passed by the charm through the private_key parameter, "
-                "this function can't be used"
-            )
         if not self._private_key_generated():
             logger.warning("No private key to regenerate")
             return
-        self._generate_private_key()
+        self._regenerate_private_key()
         self._cleanup_certificate_requests()
         self._send_certificate_requests()
 
-    def _generate_private_key(self) -> None:
-        """Generate a new private key and store it in a secret.
-
-        This is the case when the private key used is generated by the library.
-            and not passed by the charm using the private_key parameter.
-        """
-        self._store_private_key_in_secret(generate_private_key())
-        logger.info("Private key generated")
+    def _regenerate_private_key(self) -> None:
+        secret = self.charm.model.get_secret(label=self._get_private_key_secret_label())
+        secret.set_content({"private-key": str(generate_private_key())})
 
     def _private_key_generated(self) -> bool:
-        """Check if a private key is stored in a secret.
-
-        This is the case when the private key used is generated by the library.
-        This should not exist when the private key used
-            is passed by the charm using the private_key parameter.
-        """
         try:
-            secret = self.charm.model.get_secret(label=self._get_private_key_secret_label())
-            secret.get_content(refresh=True)
-            return True
-        except SecretNotFoundError:
+            self.charm.model.get_secret(label=self._get_private_key_secret_label())
+        except (SecretNotFoundError, KeyError):
             return False
-
-    def _store_private_key_in_secret(self, private_key: PrivateKey) -> None:
-        try:
-            secret = self.charm.model.get_secret(label=self._get_private_key_secret_label())
-            secret.set_content({"private-key": str(private_key)})
-        except SecretNotFoundError:
-            self.charm.unit.add_secret(
-                content={"private-key": str(private_key)},
-                label=self._get_private_key_secret_label(),
-            )
-
-    def _remove_private_key_secret(self) -> None:
-        """Remove the private key secret."""
-        try:
-            secret = self.charm.model.get_secret(label=self._get_private_key_secret_label())
-            secret.remove_all_revisions()
-        except SecretNotFoundError:
-            logger.warning("Private key secret not found, nothing to remove")
+        return True
 
     def _csr_matches_certificate_request(
         self, certificate_signing_request: CertificateSigningRequest, is_ca: bool
@@ -1531,7 +1238,7 @@ class TLSCertificatesRequiresV4(Object):
 
     def get_assigned_certificate(
         self, certificate_request: CertificateRequestAttributes
-    ) -> Tuple[Optional[ProviderCertificate], Optional[PrivateKey]]:
+    ) -> Tuple[ProviderCertificate | None, PrivateKey | None]:
         """Get the certificate that was assigned to the given certificate request."""
         for requirer_csr in self.get_csrs_from_requirer_relation_data():
             if certificate_request == CertificateRequestAttributes.from_csr(
@@ -1541,9 +1248,7 @@ class TLSCertificatesRequiresV4(Object):
                 return self._find_certificate_in_relation_data(requirer_csr), self.private_key
         return None, None
 
-    def get_assigned_certificates(
-        self,
-    ) -> Tuple[List[ProviderCertificate], Optional[PrivateKey]]:
+    def get_assigned_certificates(self) -> Tuple[List[ProviderCertificate], PrivateKey | None]:
         """Get a list of certificates that were assigned to this or app."""
         assigned_certificates = []
         for requirer_csr in self.get_csrs_from_requirer_relation_data():
@@ -1554,19 +1259,12 @@ class TLSCertificatesRequiresV4(Object):
     def _find_certificate_in_relation_data(
         self, csr: RequirerCertificateRequest
     ) -> Optional[ProviderCertificate]:
-        """Return the certificate that matches the given CSR, validated against the private key."""
-        if not self.private_key:
-            return None
+        """Return the certificate that match the given CSR."""
         for provider_certificate in self.get_provider_certificates():
             if (
                 provider_certificate.certificate_signing_request == csr.certificate_signing_request
                 and provider_certificate.certificate.is_ca == csr.is_ca
             ):
-                if not provider_certificate.certificate.matches_private_key(self.private_key):
-                    logger.warning(
-                        "Certificate does not match the private key. Ignoring invalid certificate."
-                    )
-                    continue
                 return provider_certificate
         return None
 
@@ -1610,7 +1308,7 @@ class TLSCertificatesRequiresV4(Object):
                             logger.debug(
                                 "Secret %s with correct certificate already exists", secret_label
                             )
-                            continue
+                            return
                         secret.set_content(
                             content={
                                 "certificate": str(provider_certificate.certificate),
@@ -1620,7 +1318,6 @@ class TLSCertificatesRequiresV4(Object):
                         secret.set_info(
                             expire=provider_certificate.certificate.expiry_time,
                         )
-                        secret.get_content(refresh=True)
                     except SecretNotFoundError:
                         logger.debug("Creating new secret with label %s", secret_label)
                         secret = self.charm.unit.add_secret(
@@ -1678,9 +1375,9 @@ class TLSCertificatesRequiresV4(Object):
 
     def _get_private_key_secret_label(self) -> str:
         if self.mode == Mode.UNIT:
-            return f"{LIBID}-private-key-{self._get_unit_number()}-{self.relationship_name}"
+            return f"{LIBID}-private-key-{self._get_unit_number()}"
         elif self.mode == Mode.APP:
-            return f"{LIBID}-private-key-{self.relationship_name}"
+            return f"{LIBID}-private-key"
         else:
             raise TLSCertificatesError("Invalid mode. Must be Mode.UNIT or Mode.APP.")
 
@@ -1781,21 +1478,11 @@ class TLSCertificatesProvidesV4(Object):
         relation: Relation,
         provider_certificate: ProviderCertificate,
     ) -> None:
-        chain = [str(certificate) for certificate in provider_certificate.chain]
-        if chain[0] != str(provider_certificate.certificate):
-            logger.warning(
-                "The order of the chain from the TLS Certificates Provider is incorrect. "
-                "The leaf certificate should be the first element of the chain."
-            )
-        elif not chain_has_valid_order(chain):
-            logger.warning(
-                "The order of the chain from the TLS Certificates Provider is partially incorrect."
-            )
         new_certificate = _Certificate(
             certificate=str(provider_certificate.certificate),
             certificate_signing_request=str(provider_certificate.certificate_signing_request),
             ca=str(provider_certificate.ca),
-            chain=chain,
+            chain=[str(certificate) for certificate in provider_certificate.chain],
         )
         provider_certificates = self._load_provider_certificates(relation)
         if new_certificate in provider_certificates:
