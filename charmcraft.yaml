@@ -26,6 +26,7 @@ requires:
 provides:
   certificates:
     interface: tls-certificates
+    version: "4"
 
 type: charm
 base: ubuntu@24.04
